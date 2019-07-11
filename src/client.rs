@@ -1,84 +1,54 @@
-use hyper::client::Client as hyper_client;
-use hyper::client::RequestBuilder;
-use hyper::client::Response;
-use hyper::net::HttpsConnector;
-use hyper::Url;
-use hyper_native_tls::native_tls::TlsConnector;
-use hyper_native_tls::NativeTlsClient;
+use std::io::Read;
+
+use reqwest::{Client, Response, StatusCode};
 use serde_json;
 use serde_json::de::IoRead as SerdeIoRead;
-use std::io::Read;
-use std::iter::FromIterator;
-use std::net::UdpSocket;
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::time::Duration;
-use {error, serialization, ChunkedQuery, Node, Point, Points, Precision, Query};
+
+use {ChunkedQuery, error, Node, Point, Points, Precision, Query, serialization};
+
+use url::Url;
 
 /// The client to influxdb
 #[derive(Debug)]
-pub struct Client {
+pub struct InfluxClient {
     host: String,
     db: String,
     authentication: Option<(String, String)>,
-    client: HttpClient,
+    client: Client,
 }
 
-unsafe impl Send for Client {}
+unsafe impl Send for InfluxClient {}
 
-impl Client {
+impl InfluxClient {
     /// Create a new influxdb client with http
     pub fn new<T>(host: T, db: T) -> Self
-    where
-        T: ToString,
+        where
+            T: ToString,
     {
-        Client {
+        let client = Client::builder().build().expect("Could not build client");
+
+        InfluxClient {
             host: host.to_string(),
             db: db.to_string(),
             authentication: None,
-            client: HttpClient::default(),
+            client,
         }
-    }
-
-    /// Create a new influxdb client with https
-    pub fn new_with_option<T: ToString>(host: T, db: T, tls_option: Option<TLSOption>) -> Self {
-        Client {
-            host: host.to_string(),
-            db: db.to_string(),
-            authentication: None,
-            client: HttpClient::new_with_option(tls_option),
-        }
-    }
-
-    /// Set the read timeout value, unit "s"
-    pub fn set_read_timeout(&mut self, timeout: u64) {
-        self.client.set_read_timeout(Duration::from_secs(timeout));
-    }
-
-    /// Set the write timeout value, unit "s"
-    pub fn set_write_timeout(&mut self, timeout: u64) {
-        self.client.set_write_timeout(Duration::from_secs(timeout));
     }
 
     /// Change the client's database
     pub fn switch_database<T>(&mut self, database: T)
-    where
-        T: ToString,
+        where
+            T: ToString,
     {
         self.db = database.to_string();
     }
 
     /// Change the client's user
     pub fn set_authentication<T>(mut self, user: T, passwd: T) -> Self
-    where
-        T: Into<String>,
+        where
+            T: Into<String>,
     {
         self.authentication = Some((user.into(), passwd.into()));
-        self
-    }
-
-    /// Change http to https, but don't leave the read write timeout setting
-    pub fn set_tls(mut self, connector: Option<TLSOption>) -> Self {
-        self.client = HttpClient::new_with_option(connector);
         self
     }
 
@@ -91,28 +61,12 @@ impl Client {
     pub fn ping(&self) -> bool {
         let url = self.build_url("ping", None);
         if let Ok(res) = self.client.get(url).send() {
-            match res.status_raw().0 {
-                204 => true,
+            match res.status() {
+                StatusCode::OK => true,
                 _ => false,
             }
         } else {
             false
-        }
-    }
-
-    /// Query the version of the database and return the version number
-    pub fn get_version(&self) -> Option<String> {
-        let url = self.build_url("ping", None);
-        if let Ok(res) = self.client.get(url).send() {
-            match res.status_raw().0 {
-                204 => match res.headers.get_raw("X-Influxdb-Version") {
-                    Some(i) => String::from_utf8(i[0].to_vec()).ok(),
-                    None => Some(String::from("Don't know")),
-                },
-                _ => None,
-            }
-        } else {
-            None
         }
     }
 
@@ -128,7 +82,7 @@ impl Client {
     }
 
     /// Write multiple points to the database
-    pub fn write_points<T: Iterator<Item = Point>>(
+    pub fn write_points<T: Iterator<Item=Point>>(
         &self,
         points: T,
         precision: Option<Precision>,
@@ -149,20 +103,22 @@ impl Client {
 
         let url = self.build_url("write", Some(param));
 
-        let mut res = self.client.post(url).body(&line).send()?;
+        let mut res = self.client.post(url)
+            .body(line)
+            .send()?;
         let mut err = String::new();
         let _ = res.read_to_string(&mut err);
 
-        match res.status_raw().0 {
-            204 => Ok(()),
-            400 => Err(error::Error::SyntaxError(serialization::conversion(&err))),
-            401 | 403 => Err(error::Error::InvalidCredentials(
+        match res.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::BAD_REQUEST => Err(error::Error::SyntaxError(serialization::conversion(err.as_str()))),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(error::Error::InvalidCredentials(
                 "Invalid authentication credentials.".to_string(),
             )),
-            404 => Err(error::Error::DataBaseDoesNotExist(
-                serialization::conversion(&err),
+            StatusCode::NOT_FOUND => Err(error::Error::DataBaseDoesNotExist(
+                serialization::conversion(err.as_str()),
             )),
-            500 => Err(error::Error::RetentionPolicyDoesNotExist(err)),
+            StatusCode::INTERNAL_SERVER_ERROR => Err(error::Error::RetentionPolicyDoesNotExist(err)),
             _ => Err(error::Error::Unknow("There is something wrong".to_string())),
         }
     }
@@ -195,7 +151,7 @@ impl Client {
             serialization::quote_ident(measurement)
         );
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -205,7 +161,7 @@ impl Client {
     pub fn create_database(&self, dbname: &str) -> Result<(), error::Error> {
         let sql = format!("Create database {}", serialization::quote_ident(dbname));
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -215,7 +171,7 @@ impl Client {
     pub fn drop_database(&self, dbname: &str) -> Result<(), error::Error> {
         let sql = format!("Drop database {}", serialization::quote_ident(dbname));
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -239,7 +195,7 @@ impl Client {
             }
         };
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -249,7 +205,7 @@ impl Client {
     pub fn drop_user(&self, user: &str) -> Result<(), error::Error> {
         let sql = format!("Drop user {}", serialization::quote_ident(user));
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -263,7 +219,7 @@ impl Client {
             serialization::quote_literal(passwd)
         );
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -276,7 +232,7 @@ impl Client {
             serialization::quote_ident(user)
         );
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -289,7 +245,7 @@ impl Client {
             serialization::quote_ident(user)
         );
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -311,7 +267,7 @@ impl Client {
             serialization::quote_ident(user)
         );
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -333,7 +289,7 @@ impl Client {
             serialization::quote_ident(user)
         );
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -382,7 +338,7 @@ impl Client {
             }
         };
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -404,7 +360,7 @@ impl Client {
             serialization::quote_ident(database)
         );
 
-        match self.query_raw(&sql, None) {
+        match self.query_raw(sql.as_str(), None) {
             Ok(_) => Ok(()),
             Err(e) => Err(e),
         }
@@ -439,18 +395,19 @@ impl Client {
             }
         };
 
-        match res.status_raw().0 {
-            200 => Ok(res),
-            400 => {
+        println!("Status is: {:?}", res.status());
+        match res.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(res),
+            StatusCode::BAD_REQUEST => {
                 let mut context = String::new();
                 let _ = res.read_to_string(&mut context);
-                let json_data: Query = serde_json::from_str(&context).unwrap();
+                let json_data: Query = serde_json::from_str(context.as_str()).unwrap();
 
                 Err(error::Error::SyntaxError(serialization::conversion(
-                    &json_data.error.unwrap(),
+                    json_data.error.unwrap().as_str(),
                 )))
             }
-            401 | 403 => Err(error::Error::InvalidCredentials(
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(error::Error::InvalidCredentials(
                 "Invalid authentication credentials.".to_string(),
             )),
             _ => Err(error::Error::Unknow("There is something wrong".to_string())),
@@ -464,7 +421,7 @@ impl Client {
         let mut context = String::new();
         let _ = response.read_to_string(&mut context);
 
-        let json_data: Query = serde_json::from_str(&context).unwrap();
+        let json_data: Query = serde_json::from_str(context.as_str()).unwrap();
         Ok(json_data)
     }
 
@@ -500,145 +457,9 @@ impl Client {
     }
 }
 
-impl Default for Client {
+impl Default for InfluxClient {
     /// connecting for default database `test` and host `http://localhost:8086`
     fn default() -> Self {
-        Client::new("http://localhost:8086", "test")
-    }
-}
-
-/// Option for configuring the behavior of a `Client`.
-#[derive(Default, Clone)]
-pub struct TLSOption {
-    /// A `native_tls::TlsConnector` configured as desired for HTTPS connections.
-    pub connector: Option<TlsConnector>,
-}
-
-impl TLSOption {
-    /// Create a new Tls_option
-    pub fn new(connector: TlsConnector) -> Self {
-        TLSOption {
-            connector: Some(connector),
-        }
-    }
-
-    fn get_connector(self) -> TlsConnector {
-        self.connector.unwrap()
-    }
-}
-
-#[derive(Debug)]
-struct HttpClient {
-    client: hyper_client,
-}
-
-impl HttpClient {
-    /// Constructs a new `HttpClient`.
-    fn new() -> Self {
-        HttpClient {
-            client: hyper_client::new(),
-        }
-    }
-
-    /// Constructs a new `HttpClient` with option config.
-    fn new_with_option(tls_option: Option<TLSOption>) -> Self {
-        let connector = match tls_option {
-            Some(tls_connector) => {
-                let native_tls_client = NativeTlsClient::from(tls_connector.get_connector());
-                HttpsConnector::new(native_tls_client)
-            }
-            None => {
-                let ssl = NativeTlsClient::new().unwrap();
-                HttpsConnector::new(ssl)
-            }
-        };
-
-        HttpClient {
-            client: hyper_client::with_connector(connector),
-        }
-    }
-
-    /// Set the read timeout value for all requests.
-    fn set_read_timeout(&mut self, timeout: Duration) {
-        self.client.set_read_timeout(Some(timeout));
-    }
-
-    /// Set the write timeout value for all requests.
-    fn set_write_timeout(&mut self, timeout: Duration) {
-        self.client.set_write_timeout(Some(timeout));
-    }
-
-    /// Make a GET request to influxdb
-    fn get(&self, url: Url) -> RequestBuilder {
-        self.client.get(url)
-    }
-
-    /// Make a POST request to influxdb
-    fn post(&self, url: Url) -> RequestBuilder {
-        self.client.post(url)
-    }
-}
-
-impl Default for HttpClient {
-    /// Create a default `HttpClient`
-    fn default() -> Self {
-        HttpClient::new()
-    }
-}
-
-/// Udp client
-pub struct UdpClient {
-    hosts: Vec<SocketAddr>,
-}
-
-impl UdpClient {
-    /// Create a new udp client.
-    /// panic when T can't convert to SocketAddr
-    pub fn new<T: Into<String>>(address: T) -> Self {
-        UdpClient {
-            hosts: vec![address.into().to_socket_addrs().unwrap().next().unwrap()],
-        }
-    }
-
-    /// add udp host.
-    /// panic when T can't convert to SocketAddr
-    pub fn add_host<T: Into<String>>(&mut self, address: T) {
-        self.hosts
-            .push(address.into().to_socket_addrs().unwrap().next().unwrap())
-    }
-
-    /// View current hosts
-    pub fn get_host(&self) -> Vec<SocketAddr> {
-        self.hosts.to_owned()
-    }
-
-    /// Send Points to influxdb.
-    pub fn write_points(&self, points: Points) -> Result<(), error::Error> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-
-        let line = serialization::line_serialization(points);
-        let line = line.as_bytes();
-        socket.send_to(&line, self.hosts.as_slice())?;
-
-        Ok(())
-    }
-
-    /// Send Point to influxdb.
-    pub fn write_point(&self, point: Point) -> Result<(), error::Error> {
-        let points = Points { point: vec![point] };
-        self.write_points(points)
-    }
-}
-
-impl FromIterator<SocketAddr> for UdpClient {
-    /// Create udp client from iterator.
-    fn from_iter<I: IntoIterator<Item = SocketAddr>>(iter: I) -> Self {
-        let mut hosts = Vec::new();
-
-        for i in iter {
-            hosts.push(i);
-        }
-
-        UdpClient { hosts }
+        InfluxClient::new("http://localhost:8086", "test")
     }
 }
